@@ -36,14 +36,19 @@ data class Signal(
 
 class SignalStore {
     private val signals = linkedMapOf<String, Signal>()
-    @Synchronized fun resetMeasurements() { signals.values.forEach { it.readings.clear() } }
-    @Synchronized fun upsert(id: String, label: String, kind: String, rssi: Int, mhz: Int, pose: SpatialPose) {
+    private val cachedEstimates = mutableMapOf<String, Pair<Long, Estimated?>>()
+    @Synchronized fun resetMeasurements() {
+        signals.values.forEach { it.readings.clear() }
+        cachedEstimates.clear()
+    }
+    @Synchronized fun upsert(id: String, label: String, kind: String, rssi: Int, mhz: Int,
+                             pose: SpatialPose, recordSample: Boolean = true) {
         val d = signals.getOrPut(id) { Signal(id, label, kind, rssi) }
         if (label.isNotBlank() && label != "<unknown>") d.label = label
         d.rssi = rssi
         d.mhz = mhz
         d.seenAt = System.currentTimeMillis()
-        if (rssi !in -110..-15) return
+        if (!recordSample || rssi !in -110..15) return
         val last = d.readings.lastOrNull()
         if (last == null || System.currentTimeMillis() - last.time >= 1100 ||
             hypot(last.x - pose.x, last.z - pose.z) > .35) {
@@ -59,50 +64,73 @@ class SignalStore {
 
     // Deliberately conservative: do not plot a made-up bearing from a single RSSI reading.
     // This is a coarse, flat-floor least-squares fit, not precision ranging.
-    fun estimate(device: Signal): Estimated? {
+    @Synchronized fun estimate(device: Signal): Estimated? {
+        val key = device.readings.lastOrNull()?.time ?: return null
+        cachedEstimates[device.id]?.let { if (it.first == key) return it.second }
+        val estimate = solvePosition(device)
+        cachedEstimates[device.id] = key to estimate
+        return estimate
+    }
+
+    fun signalBand(rssi: Int): String = when {
+        rssi >= -60 -> "強"
+        rssi >= -78 -> "中"
+        else -> "弱"
+    }
+
+    // Fit unknown transmitter strength from measurements taken at distinct locations.
+    // RSSI alone cannot tell bearing and cannot guarantee true location accuracy.
+    private fun solvePosition(device: Signal): Estimated? {
         val samples = device.readings.takeLast(45)
         if (samples.size < 4) return null
         val distinct = mutableListOf<Sample>()
         for (s in samples) if (distinct.none { hypot(it.x - s.x, it.z - s.z) < .75 }) distinct.add(s)
         if (distinct.size < 3) return null
         val baseline = distinct.maxOf { a -> distinct.maxOf { b -> hypot(a.x - b.x, a.z - b.z) } }
-        if (baseline < 1.8) return null
+        if (baseline < 2.0) return null
         val obs = samples.filter { System.currentTimeMillis() - it.time < 20 * 60 * 1000 }
         if (obs.size < 4) return null
+        if (obs.maxOf { it.rssi } - obs.minOf { it.rssi } < 4) return null
         val cx = obs.map { it.x }.average()
         val cz = obs.map { it.z }.average()
         val cy = obs.map { it.y }.average()
-        val range = min(22.0, max(7.0, baseline * 2.2))
+        val range = min(28.0, max(8.0, baseline * 1.8))
         var bestLoss = Double.POSITIVE_INFINITY
         var bx = cx
         var bz = cz
-        val iterations = 44
-        for (ix in 0..iterations) {
-            val x = cx - range + (2 * range * ix / iterations)
-            for (iz in 0..iterations) {
-                val z = cz - range + (2 * range * iz / iterations)
+        val grid = 32
+        for (ix in 0..grid) {
+            val x = cx - range + (2 * range * ix / grid)
+            for (iz in 0..grid) {
+                val z = cz - range + (2 * range * iz / grid)
+                // Unknown transmission power is estimated independently for each device.
+                val offsets = DoubleArray(obs.size) { index ->
+                    val p = obs[index]
+                    val distance = max(.7, hypot(x - p.x, z - p.z))
+                    p.rssi + 22.0 * log10(distance)
+                }
+                val tx = offsets.average()
                 var loss = 0.0
-                for (s in obs) {
-                    val measured = rssiDistance(s.rssi)
-                    val model = max(.4, hypot(x - s.x, z - s.z))
-                    val difference = ln(model / measured)
-                    loss += min(6.0, difference * difference)
+                for (offset in offsets) {
+                    val error = (offset - tx) / 8.0
+                    loss += min(5.0, error * error)
                 }
                 loss /= obs.size
                 if (loss < bestLoss) { bestLoss = loss; bx = x; bz = z }
             }
         }
-        if (bestLoss > 1.3) return null
-        val uncertainty = (2.0 + sqrt(bestLoss) * 7.0 + 6.0 / baseline).coerceIn(2.0, 20.0)
-        val confidence = ((1 - bestLoss / 1.3) * min(1.0, baseline / 6.0) * 70).roundToInt().coerceIn(5, 70)
+        if (bestLoss > 1.0) return null
+        // Broad heuristic radius; NOT a statistical measurement of accuracy.
+        val uncertainty = (4.0 + sqrt(bestLoss) * 11.0 + 12.0 / baseline).coerceIn(4.0, 30.0)
+        val confidence = ((1.0 - bestLoss) * min(1.0, baseline / 8.0) * 55).roundToInt().coerceIn(5, 55)
         return Estimated(bx, cy, bz, uncertainty, confidence)
     }
-    private fun rssiDistance(rssi: Int) = 10.0.pow((-46.0 - rssi.coerceIn(-105, -20)) / 24.0).coerceIn(.4, 35.0)
+
 }
 
 data class SpatialPose(val x: Double, val y: Double, val z: Double, val heading: Double, val ar: Boolean)
 
-class MotionTracker(context: Context): SensorEventListener {
+class MotionTracker(private val context: Context): SensorEventListener {
     private val sensors = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val rotation = sensors.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
     private val steps = sensors.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
@@ -114,19 +142,40 @@ class MotionTracker(context: Context): SensorEventListener {
     private var inAR = false
     private var lastPeak = 0L
     private var wasPeak = false
+    private var usingStepDetector = false
+    private var stepsCounted = 0
+    private var totalWalked = 0.0
+    @Synchronized fun steps(): Int = stepsCounted
+    @Synchronized fun travelled(): Double = totalWalked
     @Synchronized fun snapshot(): SpatialPose = SpatialPose(x, y, z, heading, inAR)
-    @Synchronized fun reset() { x = 0.0; y = 1.4; z = 0.0; inAR = false }
+    @Synchronized fun reset() {
+        x = 0.0; y = 1.4; z = 0.0; inAR = false
+        stepsCounted = 0; totalWalked = 0.0
+    }
     @Synchronized fun setAR(x0: Float, y0: Float, z0: Float) { x = x0.toDouble(); y = y0.toDouble(); z = z0.toDouble(); inAR = true }
     @Synchronized fun setARInactive() { inAR = false }
     fun start() {
         rotation?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
-        val stepSensor = steps ?: accelerometer
-        stepSensor?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        val permitted = Build.VERSION.SDK_INT < 29 ||
+            context.checkSelfPermission(android.Manifest.permission.ACTIVITY_RECOGNITION) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        usingStepDetector = false
+        if (permitted && steps != null) {
+            try {
+                usingStepDetector = sensors.registerListener(this, steps, SensorManager.SENSOR_DELAY_GAME)
+            } catch (_: SecurityException) { usingStepDetector = false }
+        }
+        // Fallback when no step sensor exists or motion permission was denied.
+        if (!usingStepDetector) accelerometer?.let {
+            sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
     }
-    fun stop() { sensors.unregisterListener(this) }
+    fun stop() { sensors.unregisterListener(this); usingStepDetector = false }
     @Synchronized private fun step() {
+        stepsCounted++
+        totalWalked += .72
         if (inAR) return
-        // Relative pedestrian dead reckoning; stride is an estimate, not a measured distance.
+        // Approximate stride, not the actual measured travel distance.
         x += .72 * sin(heading)
         z -= .72 * cos(heading)
     }
@@ -140,7 +189,7 @@ class MotionTracker(context: Context): SensorEventListener {
                 synchronized(this) { heading = orientation[0].toDouble() }
             }
             Sensor.TYPE_STEP_DETECTOR -> synchronized(this) { step() }
-            Sensor.TYPE_ACCELEROMETER -> if (steps == null) {
+            Sensor.TYPE_ACCELEROMETER -> if (!usingStepDetector) {
                 val a = event.values
                 val norm = sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2])
                 val peak = norm > 12.2f
@@ -164,10 +213,11 @@ class RadioScanner(private val context: Context, private val store: SignalStore,
     private var active = false
     private var bleStarted = false
     private var registered = false
+    private val wifiLastSeen = mutableMapOf<String, Long>()
     private val loop = object: Runnable {
         override fun run() {
             if (!active) return
-            try { wifi.startScan(); readWifi() } catch (_: SecurityException) {}
+            try { wifi.startScan(); readWifi(false) } catch (_: SecurityException) {}
             handler.postDelayed(this, 32_000)
         }
     }
@@ -175,7 +225,8 @@ class RadioScanner(private val context: Context, private val store: SignalStore,
         @SuppressLint("MissingPermission")
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
-                WifiManager.SCAN_RESULTS_AVAILABLE_ACTION -> readWifi()
+                WifiManager.SCAN_RESULTS_AVAILABLE_ACTION ->
+                    readWifi(intent.getBooleanExtra(WifiManager.EXTRA_RESULTS_UPDATED, false))
                 BluetoothDevice.ACTION_FOUND -> {
                     val d = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
                             else @Suppress("DEPRECATION") intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
@@ -229,12 +280,21 @@ class RadioScanner(private val context: Context, private val store: SignalStore,
         catch (_: IllegalStateException) {}
     }
     @SuppressLint("MissingPermission")
-    private fun readWifi() {
+    private fun readWifi(fresh: Boolean) {
         try {
+            val nowMicros = SystemClock.elapsedRealtimeNanos() / 1_000L
             wifi.scanResults.forEach { item ->
                 if (item.BSSID.isNullOrBlank()) return@forEach
-                val ssid = item.SSID.takeIf { it.isNotBlank() } ?: "Hidden Wi-Fi"
-                store.upsert("WIFI:" + item.BSSID, ssid, "WIFI", item.level, item.frequency, motion.snapshot())
+                val key = "WIFI:" + item.BSSID
+                val label = item.SSID.takeIf { it.isNotBlank() } ?: "Hidden Wi-Fi"
+                // The AP list is still shown even if Android returned cached scan results.
+                // A spatial measurement must have a fresh timestamp and a completed scan.
+                val timestamp = item.timestamp
+                val newTimestamp = timestamp > (wifiLastSeen[key] ?: 0L)
+                val recent = timestamp > 0 && nowMicros - timestamp in 0L..15_000_000L
+                val acceptSample = fresh && newTimestamp && recent
+                if (newTimestamp) wifiLastSeen[key] = timestamp
+                store.upsert(key, label, "WIFI", item.level, item.frequency, motion.snapshot(), acceptSample)
             }
             onChange()
         } catch (_: SecurityException) {}
