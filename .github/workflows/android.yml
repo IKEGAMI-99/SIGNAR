@@ -1,21 +1,24 @@
-name: SIGNAR Android
+name: SIGNAR Android Release
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
     branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: signar-release
+  cancel-in-progress: false
+
 jobs:
   android:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -23,52 +26,37 @@ jobs:
       - name: Install Android SDK 35
         run: |
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
-          test -n "$SDKMANAGER" || { echo "::error::sdkmanager not installed"; exit 1; }
+          test -n "$SDKMANAGER" || exit 1
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SIGNAR-debug
-          path: app/build/outputs/apk/debug/*.apk
-      - name: Check release signing secrets
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+      - name: Keep the same personal-use APK signing certificate
         run: |
-          test -n "$SIGNING_KEYSTORE_BASE64" && test -n "$SIGNING_STORE_PASSWORD" && test -n "$SIGNING_KEY_PASSWORD" && test -n "$SIGNING_KEY_ALIAS" || {
-            echo "::error::Configure the four permanent signing secrets first."
-            exit 1
-          }
+          if [ ! -f signing/signar-personal.jks ]; then
+            mkdir -p signing
+            keytool -genkeypair -noprompt -storetype JKS -keystore signing/signar-personal.jks -storepass android -keypass android -alias signar -keyalg RSA -keysize 3072 -validity 10000 -dname "CN=SIGNAR Personal Test, O=SIGNAR"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -f signing/signar-personal.jks
+            git commit -m "chore: pin personal test signing certificate [skip ci]"
+            git push origin HEAD:main
+          fi
       - name: Build permanently signed release APK
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
-          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
-          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
-          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_STORE_PASSWORD: android
+          SIGNING_KEY_PASSWORD: android
+          SIGNING_KEY_ALIAS: signar
         run: |
-          printf '%s' "$SIGNING_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/signar-release.jks"
-          export SIGNING_KEYSTORE_PATH="$RUNNER_TEMP/signar-release.jks"
-          export SIGNAR_VERSION_NAME="${GITHUB_REF_NAME#v}"
+          export SIGNING_KEYSTORE_PATH="$GITHUB_WORKSPACE/signing/signar-personal.jks"
+          export SIGNAR_VERSION_NAME="0.1.${GITHUB_RUN_NUMBER}"
           gradle :app:assembleRelease --no-daemon
           cp app/build/outputs/apk/release/app-release.apk signar.apk
           sha256sum signar.apk > signar.apk.sha256
-          rm -f "$SIGNING_KEYSTORE_PATH"
-      - name: Publish signed APK to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish APK to GitHub Releases
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" signar.apk signar.apk.sha256 --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" signar.apk signar.apk.sha256 --title "SIGNAR $GITHUB_REF_NAME" --generate-notes
-          fi
+          TAG="v0.1.${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" signar.apk signar.apk.sha256 --target "$(git rev-parse HEAD)" --title "SIGNAR $TAG" --notes "Personal-use Android APK with a fixed test signing certificate. Open the app's Update tab to install newer GitHub Releases."
