@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -417,74 +418,133 @@ class MainActivity : Activity() {
     }
 }
 
-private class RadarView(context:Context, private val store:SignalStore,private val motion:MotionTracker): View(context) {
-    private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
-    override fun onDraw(canvas:Canvas) {
+private data class RadarOptions(
+    val scaleMeters: Double,
+    val maxDevices: Int,
+    val uncertainty: Boolean
+)
+
+private class RadarView(
+    context: Context,
+    private val store: SignalStore,
+    private val motion: MotionTracker,
+    private val options: () -> RadarOptions
+) : View(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private data class Marker(
+        val x: Float, val y: Float, val label: String, val kind: String,
+        val radius: Float, val rssi: Int
+    )
+    private data class Cluster(val centerX: Float, val centerY: Float, val main: Marker, var count: Int = 1)
+    override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        val density=resources.displayMetrics.density
-        val cx=width/2f
-        val cy=height/2f
-        val radius=min(width,height)*.42f
+        val density = resources.displayMetrics.density
+        val scale = options()
+        val cx = width / 2f
+        val cy = height / 2f
+        val radius = min(width, height) * .43f
         canvas.drawColor(NAVY)
-        paint.style=Paint.Style.STROKE
-        paint.strokeWidth=1.2f*density
-        paint.color=Color.rgb(31,89,100)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 1.2f * density
+        paint.color = Color.rgb(31,89,100)
         for (r in 1..4) canvas.drawCircle(cx,cy,radius*r/4,paint)
         canvas.drawLine(cx-radius,cy,cx+radius,cy,paint)
         canvas.drawLine(cx,cy-radius,cx,cy+radius,paint)
-        val active=store.list().filter { System.currentTimeMillis()-it.seenAt<300_000 }
-        val strong=active.count { it.rssi>=-60 }
-        val medium=active.count { it.rssi in -78..-61 }
-        // The rings indicate signal strength only, never a measured bearing.
-        val bars=listOf(Triple(strong,CYAN,0.96f),Triple(medium,MINT,0.90f))
-        bars.forEach { (count,color,fraction) ->
-            if (count>0) {
-                paint.color=color
+        paint.style = Paint.Style.FILL
+        paint.color = MINT
+        canvas.drawCircle(cx,cy,4f*density,paint)
+        paint.color = WHITE
+        paint.textSize = 11f * resources.displayMetrics.scaledDensity
+        canvas.drawText("YOU",cx+7f*density,cy+15f*density,paint)
+        paint.color = Color.rgb(100,160,169)
+        paint.textSize = 11f * resources.displayMetrics.scaledDensity
+        canvas.drawText("${scale.scaleMeters.toInt()}m",cx+radius-42f*density,cy-10f*density,paint)
+
+        val pose = motion.snapshot()
+        val now = System.currentTimeMillis()
+        val markers = store.list().asSequence()
+            .filter { now - it.seenAt < 300_000 }
+            .mapNotNull { device ->
+                val estimate = store.estimate(device) ?: return@mapNotNull null
+                val dx=estimate.x-pose.x
+                val dz=estimate.z-pose.z
+                if (hypot(dx,dz) > scale.scaleMeters) return@mapNotNull null
+                val x=cx+(dx/scale.scaleMeters*radius).toFloat()
+                val y=cy+(dz/scale.scaleMeters*radius).toFloat()
+                Marker(x,y,device.label,device.kind,
+                    (estimate.radius/scale.scaleMeters*radius).toFloat(),
+                    device.rssi)
+            }
+            .sortedByDescending { it.rssi }
+            .take(scale.maxDevices)
+            .toList()
+        // Nearby device markers are grouped visually, rather than painting
+        // overlapping names at identical positions.
+        val clusters=mutableListOf<Cluster>()
+        for (marker in markers) {
+            val cluster=clusters.firstOrNull {
+                hypot(it.centerX-marker.x,it.centerY-marker.y) < 17f*density
+            }
+            if (cluster != null) cluster.count++
+            else clusters.add(Cluster(marker.x,marker.y,marker))
+        }
+        for (cluster in clusters) {
+            val marker=cluster.main
+            paint.color=when(marker.kind) { "WIFI" -> CYAN; "BLE" -> MINT; else -> AMBER }
+            if (scale.uncertainty) {
                 paint.style=Paint.Style.STROKE
-                paint.strokeWidth=2.4f*density
-                paint.alpha=110
-                val band=radius*fraction
-                canvas.drawArc(cx-band,cy-band,cx+band,cy+band,-90f,min(270f,10f+count*4f),false,paint)
+                paint.strokeWidth=1.15f*density
+                paint.alpha=85
+                canvas.drawCircle(marker.x,marker.y,marker.radius.coerceIn(10f*density,radius*1.3f),paint)
                 paint.alpha=255
             }
-        }
-        paint.style=Paint.Style.FILL
-        paint.color=MINT
-        canvas.drawCircle(cx,cy,5f*density,paint)
-        paint.color=WHITE
-        paint.textSize=12f*density
-        canvas.drawText("YOU",cx+8f*density,cy+17f*density,paint)
-        paint.color=Color.rgb(100,160,169)
-        paint.textSize=10f*density
-        canvas.drawText("20m",cx+radius-30f*density,cy-9f*density,paint)
-        val pose=motion.snapshot()
-        var shown=0
-        active.sortedByDescending { it.rssi }.take(100).forEach { d ->
-            val estimate=store.estimate(d) ?: return@forEach
-            val dx=estimate.x-pose.x
-            val dz=estimate.z-pose.z
-            if(hypot(dx,dz)>20) return@forEach
-            val x=cx+(dx/20*radius).toFloat()
-            val y=cy+(dz/20*radius).toFloat()
-            paint.color=if(d.kind=="WIFI") CYAN else if(d.kind=="BLE") MINT else AMBER
-            paint.style=Paint.Style.STROKE;paint.strokeWidth=1.3f*density
-            canvas.drawCircle(x,y,(estimate.radius/20*radius).toFloat().coerceAtLeast(5f*density),paint)
             paint.style=Paint.Style.FILL
-            canvas.drawCircle(x,y,4.5f*density,paint)
-            paint.textSize=10f*density
-            canvas.drawText(d.label.take(12),x+6f*density,y-6f*density,paint)
-            shown++
+            canvas.drawCircle(marker.x,marker.y,if (cluster.count>1) 8f*density else 5.5f*density,paint)
+            if (cluster.count>1) {
+                paint.color=NAVY
+                paint.textAlign=Paint.Align.CENTER
+                paint.typeface=Typeface.DEFAULT_BOLD
+                paint.textSize=9f*resources.displayMetrics.scaledDensity
+                canvas.drawText(cluster.count.toString(),marker.x,marker.y+3f*density,paint)
+                paint.textAlign=Paint.Align.LEFT
+                paint.typeface=Typeface.DEFAULT
+            }
         }
-        if(shown==0) {
+        // Show a small number of readable labels, avoiding label collisions.
+        val occupied=mutableListOf<RectF>()
+        var labeled=0
+        for (cluster in clusters) {
+            if (labeled>=4) break
+            val marker=cluster.main
+            val caption=marker.label.take(15)+(if(cluster.count>1) " +${cluster.count-1}" else "")
+            paint.textSize=11f*resources.displayMetrics.scaledDensity
+            val textWidth=paint.measureText(caption)
+            val labelWidth=textWidth+14f*density
+            val labelHeight=24f*density
+            val lx=(marker.x+9f*density).coerceIn(3f*density,
+                max(3f*density,width-labelWidth-3f*density))
+            val ly=(marker.y-labelHeight-10f*density).coerceIn(3f*density,
+                max(3f*density,height-labelHeight-3f*density))
+            val rect=RectF(lx,ly,lx+labelWidth,ly+labelHeight)
+            if (occupied.any { RectF.intersects(it,rect) }) continue
+            occupied.add(rect)
+            paint.style=Paint.Style.FILL
+            paint.color=Color.argb(225,12,32,43)
+            canvas.drawRoundRect(rect,6f*density,6f*density,paint)
+            paint.color=when(marker.kind) { "WIFI"->CYAN;"BLE"->MINT;else->AMBER }
+            canvas.drawText(caption,lx+7f*density,ly+16f*density,paint)
+            labeled++
+        }
+        if (markers.isEmpty()) {
+            paint.style=Paint.Style.FILL
             paint.color=WHITE
-            paint.style=Paint.Style.FILL
-            paint.textSize=13f*density
-            val line="推定位置: まだ不明"
+            paint.textSize=13f*resources.displayMetrics.scaledDensity
+            val line="この範囲に推定位置がありません"
             canvas.drawText(line,cx-paint.measureText(line)/2,cy-radius*.45f,paint)
-            paint.textSize=10f*density
-            paint.color=Color.rgb(153,189,198)
-            val line2="電波強度だけで方向は分かりません"
-            canvas.drawText(line2,cx-paint.measureText(line2)/2,cy-radius*.45f+17f*density,paint)
         }
+        paint.color=Color.rgb(134,178,188)
+        paint.textSize=10f*resources.displayMetrics.scaledDensity
+        canvas.drawText("表示 ${markers.size}件  /  範囲 半径${scale.scaleMeters.toInt()}m",
+            10f*density,height-10f*density,paint)
     }
 }
