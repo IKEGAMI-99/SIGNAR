@@ -17,6 +17,9 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -59,11 +62,28 @@ class MainActivity : Activity() {
     private var listView: LinearLayout? = null
     private var refreshQueued = false
     private var foreground=false
+    private val radarScales = intArrayOf(5, 10, 20, 40, 80, 160)
+    private val radarLimits = intArrayOf(5, 10, 20, 50)
+    private var scaleIndex = 2
+    private var limitIndex = 1
+    private var showUncertainty = false
+    private var scaleLabel: TextView? = null
+    private var limitLabel: TextView? = null
+    private var uncertaintyButton: Button? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor=NAVY
-        window.navigationBarColor=NAVY
+        // Target SDK 35 draws behind system bars. Explicit insets keep the header
+        // below status icons and the bottom status panel above gesture navigation.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.statusBarColor=Color.TRANSPARENT
+        window.navigationBarColor=Color.TRANSPARENT
+        WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars=false
+        WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightNavigationBars=false
+        val preferences=getSharedPreferences("display",MODE_PRIVATE)
+        scaleIndex=preferences.getInt("radar_scale",2).coerceIn(0,radarScales.lastIndex)
+        limitIndex=preferences.getInt("radar_limit",1).coerceIn(0,radarLimits.lastIndex)
+        showUncertainty=preferences.getBoolean("radar_uncertainty",false)
         motion=MotionTracker(this)
         scanner=RadioScanner(this,signals,motion) { scheduleRefresh() }
         updater=GithubUpdater(this) {
@@ -71,6 +91,11 @@ class MainActivity : Activity() {
             updateStatus?.text=it
         }
         val root=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setBackgroundColor(NAVY) }
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            val sys=insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            root.setPadding(0,sys.top,0,sys.bottom)
+            insets
+        }
         val header=LinearLayout(this).apply {
             orientation=LinearLayout.VERTICAL
             setPadding(dp(18),dp(15),dp(18),dp(6))
@@ -118,6 +143,9 @@ class MainActivity : Activity() {
         arView?.pause()
         content.removeAllViews()
         radarView=null
+        scaleLabel=null
+        limitLabel=null
+        uncertaintyButton=null
         radarProgress=null
         radarSignalList=null
         listView=null
@@ -133,16 +161,52 @@ class MainActivity : Activity() {
     private fun showRadar() {
         val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         panel.addView(heading("空間レーダー"))
-        panel.addView(text("点＝推定位置、円＝大まかな不確実性。方向不明の電波は下に表示します。",12,WHITE)
-            .apply { setPadding(dp(16),0,dp(16),dp(5)) })
-        radarView = RadarView(this,signals,motion)
-        panel.addView(radarView,LinearLayout.LayoutParams(-1,dp(340)))
+        panel.addView(text("点＝推定位置。誤差円と表示件数は切替可能です。",12,WHITE)
+            .apply { setPadding(dp(16),0,dp(16),dp(7)) })
+
+        val zoom=LinearLayout(this).apply {
+            orientation=LinearLayout.HORIZONTAL
+            gravity=Gravity.CENTER_VERTICAL
+            setPadding(dp(12),0,dp(12),dp(6))
+        }
+        val minus=button("−") { changeRadarScale(-1) }
+        zoom.addView(minus,LinearLayout.LayoutParams(dp(54),dp(43)))
+        scaleLabel=text("",16,MINT,true).apply { gravity=Gravity.CENTER }
+        zoom.addView(scaleLabel,LinearLayout.LayoutParams(0,dp(43),1f))
+        val plus=button("+") { changeRadarScale(1) }
+        zoom.addView(plus,LinearLayout.LayoutParams(dp(54),dp(43)))
+        panel.addView(zoom)
+
+        val options=LinearLayout(this).apply {
+            orientation=LinearLayout.HORIZONTAL
+            gravity=Gravity.CENTER_VERTICAL
+            setPadding(dp(12),0,dp(12),dp(7))
+        }
+        val reduce=button("−") { changeRadarLimit(-1) }
+        options.addView(reduce,LinearLayout.LayoutParams(dp(44),dp(39)))
+        limitLabel=text("",12,WHITE,true).apply { gravity=Gravity.CENTER }
+        options.addView(limitLabel,LinearLayout.LayoutParams(0,dp(39),1f))
+        options.addView(button("+") { changeRadarLimit(1) }, LinearLayout.LayoutParams(dp(44),dp(39)))
+        uncertaintyButton=button("") {
+            showUncertainty=!showUncertainty
+            getSharedPreferences("display",MODE_PRIVATE).edit().putBoolean("radar_uncertainty",showUncertainty).apply()
+            updateRadarControls()
+        }
+        options.addView(uncertaintyButton,LinearLayout.LayoutParams(dp(114),dp(39)).apply { leftMargin=dp(8) })
+        panel.addView(options)
+
+        radarView = RadarView(this,signals,motion) {
+            RadarOptions(radarScales[scaleIndex].toDouble(),radarLimits[limitIndex],showUncertainty)
+        }
+        val display=resources.displayMetrics
+        val radarHeight=(display.heightPixels/display.density*0.38f).toInt().coerceIn(215,330)
+        panel.addView(radarView,LinearLayout.LayoutParams(-1,dp(radarHeight)))
         val counts=text("",12,MINT).apply {
             tag="counts"
             setPadding(dp(15),dp(8),dp(15),dp(4))
         }
         panel.addView(counts)
-        radarProgress = text("",12,WHITE).apply { setPadding(dp(15),dp(4),dp(15),dp(10)) }
+        radarProgress = text("",12,WHITE).apply { setPadding(dp(15),dp(4),dp(15),dp(8)) }
         panel.addView(radarProgress)
         panel.addView(text("近くで受信中  /  方向未推定の電波も表示",13,CYAN,true)
             .apply { setPadding(dp(15),0,dp(15),dp(8)) })
@@ -153,7 +217,24 @@ class MainActivity : Activity() {
         val scroll = ScrollView(this).apply { addView(radarSignalList) }
         panel.addView(scroll,LinearLayout.LayoutParams(-1,0,1f))
         content.addView(panel)
+        updateRadarControls()
         refreshScreen()
+    }
+    private fun changeRadarScale(direction: Int) {
+        scaleIndex=(scaleIndex+direction).coerceIn(0,radarScales.lastIndex)
+        getSharedPreferences("display",MODE_PRIVATE).edit().putInt("radar_scale",scaleIndex).apply()
+        updateRadarControls()
+    }
+    private fun changeRadarLimit(direction: Int) {
+        limitIndex=(limitIndex+direction).coerceIn(0,radarLimits.lastIndex)
+        getSharedPreferences("display",MODE_PRIVATE).edit().putInt("radar_limit",limitIndex).apply()
+        updateRadarControls()
+    }
+    private fun updateRadarControls() {
+        scaleLabel?.text="半径 ${radarScales[scaleIndex]}m"
+        limitLabel?.text="表示 最大${radarLimits[limitIndex]}件"
+        uncertaintyButton?.text=if(showUncertainty) "誤差円 ON" else "誤差円 OFF"
+        radarView?.invalidate()
     }
     private fun showDevices() {
         val view=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
