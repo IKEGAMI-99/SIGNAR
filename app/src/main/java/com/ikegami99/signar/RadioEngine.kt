@@ -31,14 +31,15 @@ data class Signal(
     var rssi: Int,
     var mhz: Int = 0,
     var seenAt: Long = System.currentTimeMillis(),
-    val readings: MutableList<Sample> = mutableListOf()
+    val readings: MutableList<Sample> = mutableListOf(),
+    val arReadings: MutableList<Sample> = mutableListOf()
 )
 
 class SignalStore {
     private val signals = linkedMapOf<String, Signal>()
     private val cachedEstimates = mutableMapOf<String, Pair<Long, Estimated?>>()
     @Synchronized fun resetMeasurements() {
-        signals.values.forEach { it.readings.clear() }
+        signals.values.forEach { it.readings.clear(); it.arReadings.clear() }
         cachedEstimates.clear()
     }
     @Synchronized fun upsert(id: String, label: String, kind: String, rssi: Int, mhz: Int,
@@ -48,19 +49,22 @@ class SignalStore {
         d.rssi = rssi
         d.mhz = mhz
         d.seenAt = System.currentTimeMillis()
-        if (!recordSample || rssi !in -110..15) return
-        val last = d.readings.lastOrNull()
+        if (!recordSample || rssi !in -110..-15) return
+        val readings = if (pose.ar) d.arReadings else d.readings
+        val last = readings.lastOrNull()
         if (last == null || System.currentTimeMillis() - last.time >= 1100 ||
             hypot(last.x - pose.x, last.z - pose.z) > .35) {
-            d.readings.add(Sample(pose.x, pose.y, pose.z, rssi, System.currentTimeMillis()))
-            if (d.readings.size > 80) d.readings.removeAt(0)
+            readings.add(Sample(pose.x, pose.y, pose.z, rssi, System.currentTimeMillis()))
+            if (readings.size > 80) readings.removeAt(0)
         }
         if (signals.size > 500) {
             val oldest = signals.values.minByOrNull { it.seenAt }
             if (oldest != null) signals.remove(oldest.id)
         }
     }
-    @Synchronized fun list(): List<Signal> = signals.values.sortedWith(compareByDescending<Signal> { it.seenAt }.thenByDescending { it.rssi }).map { it.copy(readings = it.readings.toMutableList()) }
+    @Synchronized fun list(ar: Boolean = false): List<Signal> =
+        signals.values.sortedWith(compareByDescending<Signal> { it.seenAt }.thenByDescending { it.rssi })
+            .map { it.copy(readings = (if (ar) it.arReadings else it.readings).toMutableList()) }
 
     // Deliberately conservative: do not plot a made-up bearing from a single RSSI reading.
     // This is a coarse, flat-floor least-squares fit, not precision ranging.
@@ -140,6 +144,7 @@ class MotionTracker(private val context: Context): SensorEventListener {
     private var y = 1.4
     private var z = 0.0
     private var inAR = false
+    private var savedPdrPose: Triple<Double, Double, Double>? = null
     private var lastPeak = 0L
     private var wasPeak = false
     private var usingStepDetector = false
@@ -151,9 +156,18 @@ class MotionTracker(private val context: Context): SensorEventListener {
     @Synchronized fun reset() {
         x = 0.0; y = 1.4; z = 0.0; inAR = false
         stepsCounted = 0; totalWalked = 0.0
+        savedPdrPose = null
     }
-    @Synchronized fun setAR(x0: Float, y0: Float, z0: Float) { x = x0.toDouble(); y = y0.toDouble(); z = z0.toDouble(); inAR = true }
-    @Synchronized fun setARInactive() { inAR = false }
+    @Synchronized fun setAR(x0: Float, y0: Float, z0: Float) {
+        if (!inAR) savedPdrPose = Triple(x, y, z)
+        x = x0.toDouble(); y = y0.toDouble(); z = z0.toDouble()
+        inAR = true
+    }
+    @Synchronized fun setARInactive() {
+        if (inAR) savedPdrPose?.let { (px, py, pz) -> x = px; y = py; z = pz }
+        savedPdrPose = null
+        inAR = false
+    }
     fun start() {
         rotation?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
         val permitted = Build.VERSION.SDK_INT < 29 ||
