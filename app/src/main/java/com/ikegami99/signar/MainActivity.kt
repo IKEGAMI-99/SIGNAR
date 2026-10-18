@@ -40,6 +40,17 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private var activeTab = "RADAR"
     private var lastTab = "RADAR"
+    private var requestedMotionPermission = false
+    private var radarProgress: TextView? = null
+    private var radarSignalList: LinearLayout? = null
+    private val heartbeat = object : Runnable {
+        override fun run() {
+            if (foreground) {
+                refreshScreen()
+                handler.postDelayed(this, 2500L)
+            }
+        }
+    }
     private var arView: ARSignalView? = null
     private var pendingUpdate: UpdateInfo? = null
     private var updateButton: Button? = null
@@ -101,15 +112,14 @@ class MainActivity : Activity() {
     private fun heading(t: String)=text(t,19,WHITE,true).apply { setPadding(dp(16),dp(10),dp(12),dp(12)) }
     private fun renderTab() {
         if (!::content.isInitialized) return
-        if (lastTab == "AR" && activeTab != "AR") {
-            // ARCore uses its own arbitrary world origin; never mix it with PDR samples.
-            signals.resetMeasurements()
-            motion.reset()
-        }
+        // AR and walking measurements are isolated in SignalStore.
+        // Do not throw away the accumulated radar observations on tab switches.
         lastTab = activeTab
         arView?.pause()
         content.removeAllViews()
         radarView=null
+        radarProgress=null
+        radarSignalList=null
         listView=null
         updateButton=null
         updateStatus=null
@@ -121,13 +131,27 @@ class MainActivity : Activity() {
         }
     }
     private fun showRadar() {
-        val panel=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL }
+        val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         panel.addView(heading("空間レーダー"))
-        panel.addView(text("位置が推定できた電波源だけを表示します。円の大きさは推定誤差です。",12,WHITE).apply { setPadding(dp(16),0,dp(16),dp(10)) })
-        radarView=RadarView(this,signals,motion)
-        panel.addView(radarView,LinearLayout.LayoutParams(-1,0,1f))
-        val counts=text("",12,MINT).apply { tag="counts";setPadding(dp(16),dp(6),0,dp(10)) }
+        panel.addView(text("点＝推定位置、円＝大まかな不確実性。方向不明の電波は下に表示します。",12,WHITE)
+            .apply { setPadding(dp(16),0,dp(16),dp(5)) })
+        radarView = RadarView(this,signals,motion)
+        panel.addView(radarView,LinearLayout.LayoutParams(-1,dp(340)))
+        val counts=text("",12,MINT).apply {
+            tag="counts"
+            setPadding(dp(15),dp(8),dp(15),dp(4))
+        }
         panel.addView(counts)
+        radarProgress = text("",12,WHITE).apply { setPadding(dp(15),dp(4),dp(15),dp(10)) }
+        panel.addView(radarProgress)
+        panel.addView(text("近くで受信中  /  方向未推定の電波も表示",13,CYAN,true)
+            .apply { setPadding(dp(15),0,dp(15),dp(8)) })
+        radarSignalList=LinearLayout(this).apply {
+            orientation=LinearLayout.VERTICAL
+            setPadding(dp(12),0,dp(12),dp(12))
+        }
+        val scroll = ScrollView(this).apply { addView(radarSignalList) }
+        panel.addView(scroll,LinearLayout.LayoutParams(-1,0,1f))
         content.addView(panel)
         refreshScreen()
     }
@@ -155,8 +179,6 @@ class MainActivity : Activity() {
         (view.parent as? android.view.ViewGroup)?.removeView(view)
         content.addView(view,FrameLayout.LayoutParams(-1,-1))
         if (foreground) {
-            signals.resetMeasurements() // ARCore world origin is distinct from PDR coordinates.
-            motion.reset()
             view.resume(this)
         }
     }
@@ -186,15 +208,45 @@ class MainActivity : Activity() {
         val now=System.currentTimeMillis()
         val detected=signals.list().filter { now - it.seenAt < 5*60*1000 }
         radarView?.invalidate()
+        val estimates=detected.associate { it.id to signals.estimate(it) }
         (radarView?.parent as? LinearLayout)?.findViewWithTag<TextView>("counts")?.text =
-            "Wi-Fi "+detected.count { it.kind=="WIFI" }+"   BLE "+detected.count { it.kind=="BLE" }+
-            "   Bluetooth "+detected.count { it.kind=="BT" }+
-            "   位置推定 "+detected.count { signals.estimate(it)!=null }
+            "Wi-Fi ${detected.count { it.kind=="WIFI" }}   BLE ${detected.count { it.kind=="BLE" }}" +
+            "   BT ${detected.count { it.kind=="BT" }}   推定 ${estimates.values.count { it != null }}"
+        val pose=motion.snapshot()
+        val uniqueSites=mutableListOf<Sample>()
+        detected.flatMap { it.readings.takeLast(15) }.forEach { sample ->
+            if (uniqueSites.none { hypot(it.x-sample.x,it.z-sample.z) > 0.0 && hypot(it.x-sample.x,it.z-sample.z) < .9 || (it.x==sample.x && it.z==sample.z) }) {
+                uniqueSites.add(sample)
+            }
+        }
+        val maxBaseline = if (uniqueSites.isEmpty()) 0.0 else uniqueSites.maxOf { a ->
+            uniqueSites.maxOf { b -> hypot(a.x-b.x,a.z-b.z) }
+        }
+        radarProgress?.text = "歩数 ${motion.steps()}歩  /  推定歩行距離 ${"%.1f".format(motion.travelled())}m" +
+            "  /  観測地点 ${uniqueSites.size}  /  最大移動幅 ${"%.1f".format(maxBaseline)}m\n" +
+            (if (maxBaseline<2.0) "移動しながら複数地点で測定してください（目安：3〜5m以上）"
+             else "測定中。位置が特定できない電波は強度のみ表示します")
+        radarSignalList?.let { list ->
+            list.removeAllViews()
+            val strongest=detected.sortedByDescending { it.rssi }.take(8)
+            strongest.forEach { device ->
+                val estimate=estimates[device.id]
+                val row=LinearLayout(this).apply {
+                    orientation=LinearLayout.VERTICAL
+                    setPadding(dp(12),dp(8),dp(12),dp(8))
+                    background=GradientDrawable().apply { setColor(PANEL);cornerRadius=dp(8).toFloat() }
+                }
+                row.addView(text("${if(device.kind=="WIFI") "◉" else "●"} ${device.label.take(32)}",13,if(device.kind=="WIFI") CYAN else MINT,true))
+                row.addView(text("${device.kind}  ${device.rssi} dBm  /  ${signals.signalBand(device.rssi)}  " +
+                    (estimate?.let { "位置推定・不確実性 約${it.radius.roundToInt()}m" } ?: "方向不明 / 観測 ${device.readings.size}回"),11,WHITE))
+                list.addView(row,LinearLayout.LayoutParams(-1,-2).apply { bottomMargin=dp(5) })
+            }
+        }
         listView?.let { list ->
             list.removeAllViews()
             if (detected.isEmpty()) list.addView(text("探索中です。位置情報とBluetoothを有効にしてください。",14,WHITE))
             for (d in detected.take(150)) {
-                val estimated=signals.estimate(d)
+                val estimated=estimates[d.id]
                 val row=LinearLayout(this).apply {
                     orientation=LinearLayout.VERTICAL
                     setPadding(dp(15),dp(12),dp(15),dp(12))
@@ -202,13 +254,15 @@ class MainActivity : Activity() {
                     setOnClickListener {
                         AlertDialog.Builder(this@MainActivity).setTitle(d.label)
                             .setMessage("種類: "+d.kind+"\nID: "+d.id+"\nRSSI: "+d.rssi+" dBm\n周波数: "+d.mhz+
-                                " MHz\n位置推定: "+(estimated?.let { "約±"+it.radius.roundToInt()+" m（信頼度 "+it.confidence+"%）" } ?: "データ不足"))
+                                " MHz\n有効な測定数: "+d.readings.size+"\n位置推定: "+
+                                (estimated?.let { "大まかな不確実性 約"+it.radius.roundToInt()+" m（推定スコア "+it.confidence+"）" } ?: "方向不明・測定継続が必要"))
                             .setPositiveButton("閉じる",null).show()
                     }
                 }
                 row.addView(text((if(d.kind=="WIFI") "◉ " else "● ")+d.label,15,
                     if(d.kind=="WIFI") CYAN else MINT,true))
-                row.addView(text(d.kind+"   "+d.rssi+" dBm  •  "+(estimated?.let { "推定誤差 ±"+it.radius.roundToInt()+"m" } ?: "方向未推定"),12,WHITE))
+                row.addView(text(d.kind+"   "+d.rssi+" dBm  •  "+
+                    (estimated?.let { "推定エリア 約"+it.radius.roundToInt()+"m" } ?: "方向未推定 / 測定 "+d.readings.size+"回"),12,WHITE))
                 list.addView(row, LinearLayout.LayoutParams(-1,-2).apply { bottomMargin=dp(7) })
             }
         }
@@ -229,11 +283,21 @@ class MainActivity : Activity() {
         return perms.toTypedArray()
     }
     private fun hasPermissions(camera:Boolean)=required(camera).all { checkSelfPermission(it)==PackageManager.PERMISSION_GRANTED }
+    private fun offerMotionPermission() {
+        if (Build.VERSION.SDK_INT >= 29 && !requestedMotionPermission &&
+            checkSelfPermission(Manifest.permission.ACTIVITY_RECOGNITION) != PackageManager.PERMISSION_GRANTED) {
+            requestedMotionPermission = true
+            requestPermissions(arrayOf(Manifest.permission.ACTIVITY_RECOGNITION), 43)
+        }
+    }
     private fun ensurePermissions(camera:Boolean) {
         val missing=required(camera).filter { checkSelfPermission(it)!=PackageManager.PERMISSION_GRANTED }
         if(missing.isNotEmpty()) requestPermissions(missing.toTypedArray(),42)
-        else if(camera && activeTab=="AR") renderTab()
-        else if(foreground) scanner.start()
+        else {
+            offerMotionPermission()
+            if(camera && activeTab=="AR") renderTab()
+            else if(foreground) scanner.start()
+        }
     }
     override fun onRequestPermissionsResult(requestCode:Int,permissions:Array<out String>,grantResults:IntArray) {
         super.onRequestPermissionsResult(requestCode,permissions,grantResults)
@@ -241,6 +305,11 @@ class MainActivity : Activity() {
             if(hasPermissions(false) && foreground) scanner.start()
             if(activeTab=="AR" && hasPermissions(true)) renderTab()
             if(!hasPermissions(false)) status.text="Wi-Fi/Bluetoothを探索するには周辺デバイスと位置情報の権限が必要です"
+            else offerMotionPermission()
+        } else if (requestCode==43) {
+            motion.stop()
+            motion.start()
+            scheduleRefresh()
         }
     }
     override fun onResume() {
@@ -248,10 +317,13 @@ class MainActivity : Activity() {
         foreground=true
         motion.start()
         if(hasPermissions(false)) scanner.start()
+        handler.removeCallbacks(heartbeat)
+        handler.post(heartbeat)
         if(activeTab=="AR" && hasPermissions(true)) arView?.resume(this)
     }
     override fun onPause() {
         arView?.pause()
+        handler.removeCallbacks(heartbeat)
         scanner.stop()
         motion.stop()
         foreground=false
@@ -268,49 +340,70 @@ private class RadarView(context:Context, private val store:SignalStore,private v
     private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
     override fun onDraw(canvas:Canvas) {
         super.onDraw(canvas)
+        val density=resources.displayMetrics.density
         val cx=width/2f
         val cy=height/2f
-        val radius=min(width,height)*.41f
+        val radius=min(width,height)*.42f
         canvas.drawColor(NAVY)
         paint.style=Paint.Style.STROKE
-        paint.strokeWidth=1.5f
+        paint.strokeWidth=1.2f*density
         paint.color=Color.rgb(31,89,100)
         for (r in 1..4) canvas.drawCircle(cx,cy,radius*r/4,paint)
         canvas.drawLine(cx-radius,cy,cx+radius,cy,paint)
         canvas.drawLine(cx,cy-radius,cx,cy+radius,paint)
+        val active=store.list().filter { System.currentTimeMillis()-it.seenAt<300_000 }
+        val strong=active.count { it.rssi>=-60 }
+        val medium=active.count { it.rssi in -78..-61 }
+        // The rings indicate signal strength only, never a measured bearing.
+        val bars=listOf(Triple(strong,CYAN,0.96f),Triple(medium,MINT,0.90f))
+        bars.forEach { (count,color,fraction) ->
+            if (count>0) {
+                paint.color=color
+                paint.style=Paint.Style.STROKE
+                paint.strokeWidth=2.4f*density
+                paint.alpha=110
+                val band=radius*fraction
+                canvas.drawArc(cx-band,cy-band,cx+band,cy+band,-90f,min(270f,10f+count*4f),false,paint)
+                paint.alpha=255
+            }
+        }
         paint.style=Paint.Style.FILL
         paint.color=MINT
-        canvas.drawCircle(cx,cy,6f,paint)
+        canvas.drawCircle(cx,cy,5f*density,paint)
         paint.color=WHITE
-        paint.textSize=12f
-        canvas.drawText("YOU",cx+10,cy+16,paint)
+        paint.textSize=12f*density
+        canvas.drawText("YOU",cx+8f*density,cy+17f*density,paint)
         paint.color=Color.rgb(100,160,169)
-        canvas.drawText("20m",cx+radius-35,cy-10,paint)
+        paint.textSize=10f*density
+        canvas.drawText("20m",cx+radius-30f*density,cy-9f*density,paint)
         val pose=motion.snapshot()
         var shown=0
-        store.list().filter { System.currentTimeMillis()-it.seenAt<300_000 }.take(70).forEach { d ->
+        active.sortedByDescending { it.rssi }.take(100).forEach { d ->
             val estimate=store.estimate(d) ?: return@forEach
-            val dx=estimate.x-pose.x;val dz=estimate.z-pose.z
-            val distance=hypot(dx,dz)
-            if(distance>20) return@forEach
+            val dx=estimate.x-pose.x
+            val dz=estimate.z-pose.z
+            if(hypot(dx,dz)>20) return@forEach
             val x=cx+(dx/20*radius).toFloat()
             val y=cy+(dz/20*radius).toFloat()
             paint.color=if(d.kind=="WIFI") CYAN else if(d.kind=="BLE") MINT else AMBER
-            paint.style=Paint.Style.STROKE;paint.strokeWidth=1.5f
-            canvas.drawCircle(x,y,(estimate.radius/20*radius).toFloat().coerceAtLeast(9f),paint)
+            paint.style=Paint.Style.STROKE;paint.strokeWidth=1.3f*density
+            canvas.drawCircle(x,y,(estimate.radius/20*radius).toFloat().coerceAtLeast(5f*density),paint)
             paint.style=Paint.Style.FILL
-            canvas.drawCircle(x,y,5f,paint)
-            paint.textSize=12f
-            canvas.drawText(d.label.take(12),x+8,y-10,paint)
+            canvas.drawCircle(x,y,4.5f*density,paint)
+            paint.textSize=10f*density
+            canvas.drawText(d.label.take(12),x+6f*density,y-6f*density,paint)
             shown++
         }
         if(shown==0) {
-            paint.color=WHITE;paint.textSize=14f
-            val message="信号の推定位置を計測中"
-            canvas.drawText(message,cx-paint.measureText(message)/2,cy+radius+28,paint)
-            paint.textSize=11f;paint.color=Color.rgb(153,189,198)
-            val caption="複数地点で測定すると表示されます"
-            canvas.drawText(caption,cx-paint.measureText(caption)/2,cy+radius+48,paint)
+            paint.color=WHITE
+            paint.style=Paint.Style.FILL
+            paint.textSize=13f*density
+            val line="推定位置: まだ不明"
+            canvas.drawText(line,cx-paint.measureText(line)/2,cy-radius*.45f,paint)
+            paint.textSize=10f*density
+            paint.color=Color.rgb(153,189,198)
+            val line2="電波強度だけで方向は分かりません"
+            canvas.drawText(line2,cx-paint.measureText(line2)/2,cy-radius*.45f+17f*density,paint)
         }
     }
 }
