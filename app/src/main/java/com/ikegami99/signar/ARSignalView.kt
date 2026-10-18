@@ -158,7 +158,7 @@ class ARSignalView(context: Context, private val store: SignalStore,
                 camera.getProjectionMatrix(proj,0,0.1f,80f)
                 Matrix.multiplyMM(vp,0,proj,0,view,0)
                 val markers=mutableListOf<ArMarker>()
-                parent.store.list().take(70).forEach { signal ->
+                parent.store.list(ar = true).take(70).forEach { signal ->
                     val estimate=parent.store.estimate(signal) ?: return@forEach
                     Matrix.multiplyMV(projected,0,vp,0,floatArrayOf(estimate.x.toFloat(),estimate.y.toFloat(),estimate.z.toFloat(),1f),0)
                     if (projected[3] <= .01f) return@forEach
@@ -169,7 +169,14 @@ class ARSignalView(context: Context, private val store: SignalStore,
                             signal.label.take(22),signal.rssi,estimate.radius.roundToInt()))
                     }
                 }
+                val active = parent.store.list(ar = true).filter {
+                    System.currentTimeMillis() - it.seenAt < 300_000L
+                }
                 parent.overlay.post { parent.overlay.setMarkers(markers) }
+                parent.info.post {
+                    parent.info.text = "AR追跡中  /  検出 ${active.size}件  /  位置候補 ${markers.size}件\n" +
+                        "位置が推定できない機器も探索しています。信号強度だけでは方向は分かりません。"
+                }
             } catch (_: Exception) {
                 // ARCore can temporarily lose camera tracking; keep the UI responsive.
             }
