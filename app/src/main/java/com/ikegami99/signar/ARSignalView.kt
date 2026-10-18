@@ -5,6 +5,8 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
@@ -45,8 +47,10 @@ class ARSignalView(context: Context, private val store: SignalStore,
         text = "ARを初期化しています…"
         setTextColor(Color.WHITE)
         setBackgroundColor(Color.argb(160, 5, 19, 29))
-        setPadding(16, 14, 16, 14)
-        textSize = 12f
+        val density=resources.displayMetrics.density
+        setPadding((14*density).toInt(),(12*density).toInt(),(14*density).toInt(),(12*density).toInt())
+        textSize = 14f
+        maxLines = 3
     }
     init {
         addView(surface, LayoutParams(-1,-1))
@@ -158,7 +162,7 @@ class ARSignalView(context: Context, private val store: SignalStore,
                 camera.getProjectionMatrix(proj,0,0.1f,80f)
                 Matrix.multiplyMM(vp,0,proj,0,view,0)
                 val markers=mutableListOf<ArMarker>()
-                parent.store.list(ar = true).take(70).forEach { signal ->
+                parent.store.list(ar = true).sortedByDescending { it.rssi }.take(60).forEach { signal ->
                     val estimate=parent.store.estimate(signal) ?: return@forEach
                     Matrix.multiplyMV(projected,0,vp,0,floatArrayOf(estimate.x.toFloat(),estimate.y.toFloat(),estimate.z.toFloat(),1f),0)
                     if (projected[3] <= .01f) return@forEach
@@ -166,7 +170,7 @@ class ARSignalView(context: Context, private val store: SignalStore,
                     val ny=projected[1]/projected[3]
                     if (nx in -1.15f..1.15f && ny in -1.15f..1.15f) {
                         markers.add(ArMarker((nx+1)*w/2, (1-ny)*h/2,
-                            signal.label.take(22),signal.rssi,estimate.radius.roundToInt()))
+                            signal.label.take(30),signal.rssi,estimate.radius.roundToInt()))
                     }
                 }
                 val active = parent.store.list(ar = true).filter {
@@ -195,19 +199,51 @@ class ARSignalView(context: Context, private val store: SignalStore,
         fun setMarkers(value: List<ArMarker>) { markers=value; invalidate() }
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            markers.forEach { m ->
-                paint.style=Paint.Style.STROKE;paint.strokeWidth=2.5f;paint.color=Color.rgb(66,245,200)
-                canvas.drawCircle(m.x,m.y,21f,paint)
+            val density=resources.displayMetrics.density
+            val fontScale=resources.displayMetrics.scaledDensity
+            val labelHeight=70f*density
+            val labelWidth=minOf(242f*density,width-24f*density)
+            val occupied=mutableListOf<RectF>()
+            var shown=0
+            for (m in markers) {
+                if (shown>=8) break
+                val left=(m.x-labelWidth*.5f).coerceIn(12f*density,
+                    maxOf(12f*density,width-labelWidth-12f*density))
+                val top=(m.y-labelHeight-26f*density).coerceIn(12f*density,
+                    maxOf(12f*density,height-labelHeight-12f*density))
+                val rect=RectF(left,top,left+labelWidth,top+labelHeight)
+                val padded=RectF(rect).apply { inset(-6f*density,-6f*density) }
+                if (occupied.any { RectF.intersects(it,padded) }) continue
+                occupied.add(padded)
+                paint.style=Paint.Style.STROKE
+                paint.strokeWidth=2f*density
+                paint.color=Color.rgb(66,245,200)
+                canvas.drawCircle(m.x,m.y,12f*density,paint)
                 paint.style=Paint.Style.FILL
-                canvas.drawCircle(m.x,m.y,4f,paint)
-                val left=(m.x-85).coerceIn(4f,width-180f)
-                val top=(m.y-66).coerceAtLeast(48f)
-                paint.color=Color.argb(210,8,27,39)
-                canvas.drawRoundRect(left,top,left+177,top+49,10f,10f,paint)
-                paint.color=Color.WHITE;paint.textSize=13f
-                canvas.drawText(m.label,left+9,top+19,paint)
-                paint.color=Color.rgb(110,235,211);paint.textSize=11f
-                canvas.drawText(m.rssi.toString()+" dBm  /  ±"+m.uncertainty+"m",left+9,top+36,paint)
+                canvas.drawCircle(m.x,m.y,4f*density,paint)
+                paint.strokeWidth=1.5f*density
+                canvas.drawLine(m.x,m.y-12f*density,
+                    (left+labelWidth*.5f),top+labelHeight,paint)
+                paint.color=Color.argb(224,8,27,39)
+                canvas.drawRoundRect(rect,10f*density,10f*density,paint)
+                paint.color=Color.rgb(66,245,200)
+                paint.style=Paint.Style.STROKE
+                canvas.drawRoundRect(rect,10f*density,10f*density,paint)
+                paint.style=Paint.Style.FILL
+                paint.typeface=Typeface.DEFAULT_BOLD
+                paint.textSize=16f*fontScale
+                paint.color=Color.WHITE
+                val available=labelWidth-24f*density
+                var title=m.label
+                while(title.length>1 && paint.measureText(title)>available) title=title.dropLast(1)
+                if(title!=m.label) title=title.dropLast(1)+"…"
+                canvas.drawText(title,left+12f*density,top+28f*density,paint)
+                paint.typeface=Typeface.DEFAULT
+                paint.textSize=13f*fontScale
+                paint.color=Color.rgb(110,235,211)
+                canvas.drawText("${m.rssi} dBm    推定範囲 約±${m.uncertainty}m",
+                    left+12f*density,top+53f*density,paint)
+                shown++
             }
         }
     }
