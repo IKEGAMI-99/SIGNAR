@@ -39,6 +39,7 @@ class MainActivity : Activity() {
     private lateinit var content: FrameLayout
     private lateinit var status: TextView
     private var activeTab = "RADAR"
+    private var lastTab = "RADAR"
     private var arView: ARSignalView? = null
     private var pendingUpdate: UpdateInfo? = null
     private var updateButton: Button? = null
@@ -100,6 +101,12 @@ class MainActivity : Activity() {
     private fun heading(t: String)=text(t,19,WHITE,true).apply { setPadding(dp(16),dp(10),dp(12),dp(12)) }
     private fun renderTab() {
         if (!::content.isInitialized) return
+        if (lastTab == "AR" && activeTab != "AR") {
+            // ARCore uses its own arbitrary world origin; never mix it with PDR samples.
+            signals.resetMeasurements()
+            motion.reset()
+        }
+        lastTab = activeTab
         arView?.pause()
         content.removeAllViews()
         radarView=null
